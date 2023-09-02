@@ -56,9 +56,9 @@ public class Changelog : Window {
         Add("1.8.9.2", "Added preview images to some tweaks.");
     }
 
-#if DEBUG
+// #if DEBUG
     public const string UnreleasedVersion = "99.99.99.99";
-#endif 
+// #endif
 
     private static Dictionary<Version, List<ChangelogEntry>> Entries = new();
 

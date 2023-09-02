@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Hooking;
 using Dalamud.Logging;
+using Dalamud.Plugin.Ipc;
 using Dalamud.Utility.Signatures;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
@@ -32,20 +33,59 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
 
     private readonly int[] listItemNodeIdArray = Enumerable.Range(21001, 31).Prepend(2).ToArray();
 
+    private ICallGateSubscriber<bool> allaganIsInitialized = null!;
+    private ICallGateSubscriber<uint, bool, uint[], uint> allaganItemCountOwned = null!;
+
     private const uint CrossBaseId = 1000U;
     private const uint PadlockBaseId = 2000U;
+    private const uint InventoryBaseId = 3000U;
 
     private const int MinionCategory = 81;
     private const int MountCategory = 63;
     private const int MountSubCategory = 175;
 
+    [Flags]
     private enum ItemStatus
     {
-        Unobtainable,
-        AlreadyUnlocked,
-        Normal
+        Normal = 0,
+        Unobtainable = 1 << 0,
+        AlreadyUnlocked = 1 << 1,
+        InAnyInventory = 1 << 2
     }
-    
+
+    private static readonly uint[] AllaganToolsInventories =
+    {
+        0, // Bag0
+        1, // Bag1
+        2, // Bag2
+        3, // Bag3
+        1000, // GearSet0
+        2000, // Currency
+        2500, // Armoire
+        2501, // GlamourChest
+        3200, // ArmoryOff
+        3201, // ArmoryHead
+        3202, // ArmoryBody
+        3203, // ArmoryHand
+        3205, // ArmoryLegs
+        3206, // ArmoryFeet
+        3207, // ArmoryEar
+        3208, // ArmoryNeck
+        3209, // ArmoryWrist
+        3300, // ArmoryRing
+        3500, // ArmoryMain
+        4000, // SaddleBag0
+        4001, // SaddleBag1
+        4100, // PremiumSaddleBag0
+        4101, // PremiumSaddleBag1
+        10000, // RetainerBag0
+        10001, // RetainerBag1
+        10002, // RetainerBag2
+        10003, // RetainerBag3
+        10004, // RetainerBag4
+        11000, // RetainerEquippedGear
+    };
+
     public class Config : TweakConfig
     {
         [TweakConfigOption("Mark Un-obtainable Items")]
@@ -53,6 +93,9 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
 
         [TweakConfigOption("Mark Already Unlocked Items")]
         public bool MarkAlreadyObtained = true;
+
+        [TweakConfigOption("Mark Items Owned According to Allagan Tools (requires Allagan Tools)")]
+        public bool MarkInAnyInventory = true;
     }
 
     public Config TweakConfig { get; private set; } = null!;
@@ -67,6 +110,9 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
         AddChangelog("1.8.3.0", "Fixed tweak not checking armory and equipped items.");
         AddChangelog("1.8.3.0", "Added 'Lock Loot Window' feature.");
         AddChangelog("1.8.6.0", "Removed Window Lock Feature, 'Lock Window Position' tweak has returned.");
+
+        allaganIsInitialized = Service.PluginInterface.GetIpcSubscriber<bool>("AllaganTools.IsInitialized");
+        allaganItemCountOwned = Service.PluginInterface.GetIpcSubscriber<uint, bool, uint[], uint>("AllaganTools.ItemCountOwned");
         
         Ready = true;
     }
@@ -122,6 +168,12 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
             {
                 MakePadlockNode(PadlockBaseId + index, lootItemNode);
             }
+
+            var inventoryNode = Common.GetNodeByID(componentUldManager, InventoryBaseId + index);
+            if (inventoryNode is null)
+            {
+                MakeInventoryNode(InventoryBaseId + index, lootItemNode);
+            }
         }
     }
     
@@ -150,12 +202,20 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
             {
                 UiHelper.UnlinkAndFreeImageNode(padlockNode, AddonNeedGreed);
             }
+
+            var inventoryNode = Common.GetNodeByID<AtkImageNode>(componentUldManager, InventoryBaseId + index);
+            if (inventoryNode is not null)
+            {
+                UiHelper.UnlinkAndFreeImageNode(inventoryNode, AddonNeedGreed);
+            }
         }
     }
 
     private nint OnNeedGreedRequestedUpdate(nint addon, nint a2, nint a3)
     {
         var result = needGreedOnRequestedUpdateHook!.Original(addon, a2, a3);
+        var isAllaganToolsAvailable = IsAllaganToolsAvailable();
+        PluginLog.Warning($"OnNeedGreedRequestedUpdate (allagan = {isAllaganToolsAvailable})");
 
         try
         {
@@ -181,7 +241,8 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
                 var listItemNodeId = listItemNodeIdArray[index];
                 var listItemNode = Common.GetNodeByID<AtkComponentNode>(&listComponentNode->Component->UldManager, (uint) listItemNodeId);
                 if (listItemNode is null || listItemNode->Component is null) continue;
-                
+
+                var state = ItemStatus.Normal;
                 switch (itemData)
                 {
                     // Item is unique, and has no unlock action, and is unobtainable if we have any in our inventory
@@ -190,19 +251,20 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
                     // Item is unobtainable if its a minion/mount and already unlocked
                     case { ItemUICategory.Row: MinionCategory } when IsItemAlreadyUnlocked(itemInfo.ItemId):
                     case { ItemUICategory.Row: MountCategory, ItemSortCategory.Row: MountSubCategory } when IsItemAlreadyUnlocked(itemInfo.ItemId):
-                        UpdateNodeVisibility(listItemNode, listItemNodeId, ItemStatus.Unobtainable);
+                        state = ItemStatus.Unobtainable;
                         break;
 
                     // Item can be obtained if unlocked
                     case not null when IsItemAlreadyUnlocked(itemInfo.ItemId):
-                        UpdateNodeVisibility(listItemNode, listItemNodeId, ItemStatus.AlreadyUnlocked);
-                        break;
-                    
-                    // Item can be obtained normally
-                    default:
-                        UpdateNodeVisibility(listItemNode, listItemNodeId, ItemStatus.Normal);
+                        state = ItemStatus.AlreadyUnlocked;
                         break;
                 }
+
+                if (isAllaganToolsAvailable && IsItemInAnyInventory(itemInfo.ItemId)) {
+                    state |= ItemStatus.InAnyInventory;
+                }
+
+                UpdateNodeVisibility(listItemNode, listItemNodeId, state);
             }
         }
         catch (Exception e)
@@ -217,27 +279,14 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
     {
         var crossNode = Common.GetNodeByID<AtkImageNode>(&listItemNode->Component->UldManager, CrossBaseId + (uint) listItemId);
         var padlockNode = Common.GetNodeByID<AtkImageNode>(&listItemNode->Component->UldManager, PadlockBaseId + (uint) listItemId);
-        
-        if (crossNode is null || padlockNode is null) return;
-        
-        switch (status)
-        {
-            case ItemStatus.AlreadyUnlocked when TweakConfig.MarkAlreadyObtained:
-                crossNode->AtkResNode.ToggleVisibility(false);
-                padlockNode->AtkResNode.ToggleVisibility(true);
-                break;
-            
-            case ItemStatus.Unobtainable when TweakConfig.MarkUnobtainable:
-                crossNode->AtkResNode.ToggleVisibility(true);
-                padlockNode->AtkResNode.ToggleVisibility(false);
-                break;
-            
-            default:
-            case ItemStatus.Normal:
-                crossNode->AtkResNode.ToggleVisibility(false);
-                padlockNode->AtkResNode.ToggleVisibility(false);
-                break;
-        }
+        var inventoryNode = Common.GetNodeByID<AtkImageNode>(&listItemNode->Component->UldManager, InventoryBaseId + (uint) listItemId);
+
+        if (crossNode is null || padlockNode is null || inventoryNode is null) return;
+
+        crossNode->AtkResNode.ToggleVisibility(TweakConfig.MarkUnobtainable && (status & ItemStatus.Unobtainable) != 0);
+        padlockNode->AtkResNode.ToggleVisibility(TweakConfig.MarkAlreadyObtained && (status & ItemStatus.AlreadyUnlocked) != 0);
+        inventoryNode->AtkResNode.ToggleVisibility(TweakConfig.MarkInAnyInventory && (status & ItemStatus.InAnyInventory) != 0);
+        // inventoryNode->AtkResNode.ToggleVisibility(true);
     }
 
     private bool IsItemAlreadyUnlocked(uint itemId)
@@ -285,6 +334,26 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
         UiHelper.LinkNodeAfterTargetNode((AtkResNode*) imageNode, parent, targetTextNode);
     }
 
+    private void MakeInventoryNode(uint nodeId, AtkComponentNode* parent)
+    {
+        var imageNode = UiHelper.MakeImageNode(nodeId, new UiHelper.PartInfo(0, 0, 32, 32));
+        imageNode->AtkResNode.NodeFlags = NodeFlags.AnchorLeft | NodeFlags.AnchorTop | NodeFlags.Visible | NodeFlags.Enabled | NodeFlags.EmitsEvents; // 8243;
+        imageNode->WrapMode = 1;
+
+        imageNode->LoadIconTexture(60512, 0);
+
+        imageNode->AtkResNode.SetWidth(32);
+        imageNode->AtkResNode.SetHeight(32);
+        imageNode->AtkResNode.SetScale(1f, 1f);
+        imageNode->AtkResNode.SetPositionShort(-6, 22);
+        // imageNode->AtkResNode.SetPositionShort(7, 30);
+
+        imageNode->AtkResNode.ToggleVisibility(true);
+
+        var targetTextNode = Common.GetNodeByID<AtkResNode>(&parent->Component->UldManager, 5);
+        UiHelper.LinkNodeAfterTargetNode((AtkResNode*) imageNode, parent, targetTextNode);
+    }
+
     private bool PlayerHasItem(uint itemId)
     {
         // Only check main inventories, don't include any special inventories
@@ -313,5 +382,22 @@ public unsafe class LootWindowDuplicateUniqueItemIndicator : UiAdjustments.SubTw
         };
 
         return inventories.Sum(inventory => InventoryManager.Instance()->GetItemCountInContainer(itemId, inventory)) > 0;
+    }
+
+    private bool IsAllaganToolsAvailable()
+    {
+        try {
+            return allaganIsInitialized.InvokeFunc();
+        }
+        catch {
+            return false;
+        }
+    }
+
+    private bool IsItemInAnyInventory(uint itemId)
+    {
+        var count = allaganItemCountOwned.InvokeFunc(itemId, true, AllaganToolsInventories);
+        PluginLog.Warning($"count {itemId} = {count}");
+        return count > 0;
     }
 }
